@@ -1388,9 +1388,9 @@ setup_shell_plugin() {
       sudo -u "$current_user" tee -a "$hypr_bindings_lua" > /dev/null << HYPR_PANEL_LUA
 
 -- DeckShift — toggle the Gaming Mode control panel
-o.bind("SUPER + ALT + G", "Gaming Mode panel", "omarchy-shell shell toggle ${DECKSHIFT_PLUGIN_ID}")
+o.bind("SUPER + CTRL + ALT + G", "Gaming Mode panel", "omarchy-shell shell toggle ${DECKSHIFT_PLUGIN_ID}")
 HYPR_PANEL_LUA
-      info "Added panel keybind (Super+Alt+G) to bindings.lua"
+      info "Added panel keybind (Super+Ctrl+Alt+G) to bindings.lua"
     fi
   elif [[ -f "$hypr_bindings_conf" ]]; then
     if grep -q "toggle ${DECKSHIFT_PLUGIN_ID}" "$hypr_bindings_conf" 2>/dev/null; then
@@ -1400,13 +1400,13 @@ HYPR_PANEL_LUA
 
 bindd = SUPER ALT, G, Gaming Mode panel, exec, omarchy-shell shell toggle ${DECKSHIFT_PLUGIN_ID}
 HYPR_PANEL
-      info "Added panel keybind (Super+Alt+G) to bindings.conf"
+      info "Added panel keybind (Super+Ctrl+Alt+G) to bindings.conf"
     fi
   else
     warn "No bindings.lua or bindings.conf under ${user_home}/.config/hypr - skipping panel keybind"
   fi
 
-  info "Control panel installed — open it from the bar icon or Super+Alt+G"
+  info "Control panel installed — open it from the bar icon or Super+Ctrl+Alt+G"
   info "Already-running shells need 'omarchy-restart-shell' to pick it up"
 }
 
@@ -3019,7 +3019,7 @@ HYPR_PORTAL
   # controls WHICH session SDDM auto-logs into.
   #
   # The switching mechanism works by editing this file:
-  #   - "Session=hyprland-uwsm" → boots into Desktop Mode
+  #   - "Session=omarchy.desktop" → boots into Desktop Mode
   #   - "Session=gamescope-session-steam-nm" → boots into Gaming Mode
   #
   # The gaming-session-switch helper script toggles this value, then SDDM
@@ -3037,7 +3037,7 @@ HYPR_PORTAL
   sudo tee "$sddm_gaming_conf" > /dev/null << SDDM_GAMING
 [Autologin]
 User=${autologin_user}
-Session=hyprland-uwsm
+Session=omarchy.desktop
 Relogin=true
 SDDM_GAMING
 
@@ -3060,7 +3060,7 @@ case "$1" in
     echo "Session set to: gaming mode"
     ;;
   desktop)
-    sed -i 's/^Session=.*/Session=hyprland-uwsm/' "$CONF"
+    sed -i 's/^Session=.*/Session=omarchy.desktop/' "$CONF"
     echo "Session set to: desktop mode"
     ;;
   *)
@@ -3391,15 +3391,15 @@ verify_installation() {
          '[.bar.layout[]?[]?.id] | index($id) != null' "$shell_json" >/dev/null 2>&1; then
       echo "  ✓ bar icon present in shell.json bar layout"
     else
-      echo "  ⚠ no bar icon — open the panel with Super+Alt+G (optional)"
+      echo "  ⚠ no bar icon — open the panel with Super+Ctrl+Alt+G (optional)"
     fi
   else
     echo "  ⚠ no shell.json (or jq) — can't verify panel wiring"
   fi
   if [[ -f "$hypr_bindings_lua" ]] && grep -q "toggle ${DECKSHIFT_PLUGIN_ID}" "$hypr_bindings_lua" 2>/dev/null; then
-    echo "  ✓ panel keybind (Super+Alt+G) configured in bindings.lua"
+    echo "  ✓ panel keybind (Super+Ctrl+Alt+G) configured in bindings.lua"
   elif [[ -f "$hypr_bindings" ]] && grep -q "toggle ${DECKSHIFT_PLUGIN_ID}" "$hypr_bindings" 2>/dev/null; then
-    echo "  ✓ panel keybind (Super+Alt+G) configured in bindings.conf"
+    echo "  ✓ panel keybind (Super+Ctrl+Alt+G) configured in bindings.conf"
   else
     echo "  ⚠ panel keybind not found — bar icon still works (optional)"
   fi
@@ -3522,6 +3522,8 @@ verify_installation() {
     local test_device=$(ls /dev/input/event* 2>/dev/null | head -1)
     if [[ -r "$test_device" ]]; then
       echo "  ✓ Can read input devices"
+    elif user_in_group_db "$USER" input && ! user_in_group_session input; then
+      echo "  → Input group is configured; log out and back in to access input devices"
     else
       echo "  ✗ Cannot read $test_device (permission denied)"
       echo "    (May need to log out/in after adding to input group)"
@@ -3533,7 +3535,11 @@ verify_installation() {
   fi
 
   if $keybind_ok; then
-    echo "  → Super+Shift+R keybind should work"
+    if user_in_group_session input; then
+      echo "  → Super+Shift+R keybind should work"
+    else
+      echo "  → Log out and back in before using Super+Shift+R"
+    fi
   else
     echo "  → Super+Shift+R keybind will NOT work (use Steam > Power > Exit to Desktop)"
   fi
@@ -3574,7 +3580,7 @@ verify_installation() {
   echo ""
   echo "  SERVICE STATUS:"
   echo "  ---------------"
-  echo "  NetworkManager: $(systemctl is-active NetworkManager.service 2>/dev/null || echo 'inactive') (should be inactive until gaming mode)"
+  echo "  NetworkManager: $(systemctl is-active NetworkManager.service 2>/dev/null || true) (may stay active if it manages the desktop network)"
   echo "  iwd:            $(systemctl is-active iwd.service 2>/dev/null || echo 'inactive')"
   echo "  systemd-networkd: $(systemctl is-active systemd-networkd.service 2>/dev/null || echo 'inactive')"
   echo "  polkit:         $(systemctl is-active polkit.service 2>/dev/null || echo 'inactive')"

@@ -167,8 +167,8 @@ SDDM_CONF=/etc/sddm.conf.d/zz-gaming-session.conf
 info "Restoring the SDDM session"
 if [[ "$(path_state "$SDDM_CONF")" != no ]]; then
   if sudo -n grep -q '^Session=gamescope' "$SDDM_CONF" 2>/dev/null; then
-    run sudo sed -i 's/^Session=.*/Session=hyprland-uwsm/' "$SDDM_CONF" \
-      && ok "session set back to hyprland-uwsm before removal"
+    run sudo sed -i 's/^Session=.*/Session=omarchy.desktop/' "$SDDM_CONF" \
+      && ok "session set back to omarchy.desktop before removal"
   else
     skip "already on a desktop session"
   fi
