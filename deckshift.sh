@@ -512,7 +512,13 @@ check_steam_dependencies() {
   echo
   if [[ ! $REPLY =~ ^[Nn]$ ]]; then
     info "Upgrading system..."
-    sudo pacman -Syu || die "Failed to upgrade system"
+    # Omarchy's pacman hook aborts direct `pacman -Syu`; its own updater
+    # handles snapshots, keyrings and migrations around the upgrade.
+    if command -v omarchy &>/dev/null; then
+      omarchy update || die "Failed to upgrade system (omarchy update)"
+    else
+      sudo pacman -Syu || die "Failed to upgrade system"
+    fi
   fi
   echo ""
 
