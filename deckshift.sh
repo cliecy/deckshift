@@ -914,10 +914,9 @@ check_steam_config() {
 #    regular users. Normally these sysfs files are root-only, but udev rules
 #    can relax permissions when the devices are detected at boot.
 #
-# 2. SUDOERS RULES — Allow members of the "video" group to run specific
-#    sysctl commands (kernel scheduler tuning, VM settings, network buffers)
-#    and nvidia-smi commands without entering a password. These are narrowly
-#    scoped — only the exact commands needed, not blanket sudo access.
+# 2. SUDOERS RULES — Allow members of the "video" group to set the power
+#    profile and NVIDIA persistence/power limit without a password. Every
+#    rule is an exact command line with no wildcards.
 #
 # 3. MEMLOCK LIMITS — Increase the memory lock limit to 2GB. Games using
 #    esync/fsync need to lock memory pages to avoid latency spikes.
@@ -927,10 +926,20 @@ check_steam_config() {
 setup_performance_permissions() {
   local udev_rules_file="/etc/udev/rules.d/99-gaming-performance.rules"
   local sudoers_file="/etc/sudoers.d/gaming-mode-sysctl"
+  local nvidia_helper="/usr/local/bin/deckshift-nvidia-power-limit"
   local needs_setup=false
 
-  if [ ! -f "$udev_rules_file" ] || [ ! -f "$sudoers_file" ]; then
+  # Older installs wrote wildcard rules (`sysctl -w ...=*`) that allow root
+  # escalation; re-run setup whenever those are still present.
+  if [ ! -f "$udev_rules_file" ] || [ ! -f "$sudoers_file" ] || [ ! -x "$nvidia_helper" ] \
+     || sudo grep -q '\*' "$sudoers_file" 2>/dev/null; then
     needs_setup=true
+  fi
+
+  # Remove the unsafe rules even if the user declines the setup below.
+  if sudo grep -q '\*' "$sudoers_file" 2>/dev/null; then
+    warn "Removing unsafe wildcard sudoers rules from $sudoers_file"
+    sudo rm -f "$sudoers_file"
   fi
 
   if [ "$needs_setup" = false ]; then
@@ -971,40 +980,56 @@ UDEV_RULES
     fi
   fi
 
-  if [[ -f "$sudoers_file" ]]; then
-    info "Performance sudoers already exist at $sudoers_file"
-  else
-    info "Creating sudoers rule for Performance Mode sysctl tuning..."
+  # Root helper for the NVIDIA power limit. The wrapper used to run
+  # `sudo nvidia-smi -pl <watts>` under a `nvidia-smi -pl *` rule, but a sudoers
+  # `*` also matches spaces, so that rule allowed any extra nvidia-smi
+  # arguments as root. The helper takes a fixed keyword and reads the
+  # wattage from the driver itself.
+  info "Installing NVIDIA power-limit helper..."
+  sudo tee "$nvidia_helper" > /dev/null << 'NVIDIA_POWER'
+#!/bin/bash
+set -euo pipefail
+case "${1:-}" in
+  max)     query=power.max_limit ;;
+  default) query=power.default_limit ;;
+  *) echo "Usage: $0 {max|default}" >&2; exit 2 ;;
+esac
+watts=$(/usr/bin/nvidia-smi --query-gpu="$query" --format=csv,noheader,nounits | head -1 | cut -d. -f1)
+[[ "$watts" =~ ^[0-9]+$ ]] && (( watts > 0 )) || { echo "No valid $query reported" >&2; exit 1; }
+exec /usr/bin/nvidia-smi -pl "$watts"
+NVIDIA_POWER
+  sudo chmod 755 "$nvidia_helper"
 
-    local tee_output
-    tee_output=$(sudo tee "$sudoers_file" << 'SUDOERS_PERF' 2>&1
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_autogroup_enabled=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_migration_cost_ns=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_min_granularity_ns=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w kernel.sched_latency_ns=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.swappiness=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_ratio=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_background_ratio=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_writeback_centisecs=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w vm.dirty_expire_centisecs=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w fs.inotify.max_user_watches=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w fs.inotify.max_user_instances=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w fs.file-max=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w net.core.rmem_max=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/sysctl -w net.core.wmem_max=*
-%video ALL=(ALL) NOPASSWD: /usr/bin/nvidia-smi -pm *
-%video ALL=(ALL) NOPASSWD: /usr/bin/nvidia-smi -pl *
-%video ALL=(ALL) NOPASSWD: /usr/bin/powerprofilesctl set *
+  # Only exact command lines, never `*`: in sudoers a wildcard matches spaces
+  # too, so `sysctl -w vm.swappiness=*` used to allow appending any other
+  # sysctl (kernel.core_pattern=|... gives root). The sysctl rules were also
+  # never used by any DeckShift script, so they are gone entirely.
+  local sudoers_content
+  sudoers_content=$(cat << 'SUDOERS_PERF'
+%video ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -pm 0
+%video ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -pm 1
+%video ALL=(root) NOPASSWD: /usr/local/bin/deckshift-nvidia-power-limit max
+%video ALL=(root) NOPASSWD: /usr/local/bin/deckshift-nvidia-power-limit default
+%video ALL=(root) NOPASSWD: /usr/bin/powerprofilesctl set performance
+%video ALL=(root) NOPASSWD: /usr/bin/powerprofilesctl set balanced
+%video ALL=(root) NOPASSWD: /usr/bin/powerprofilesctl set power-saver
 SUDOERS_PERF
 )
-    local tee_exit=$?
 
-    if [[ $tee_exit -eq 0 ]]; then
-      sudo chmod 0440 "$sudoers_file"
-      info "Performance sudoers created successfully"
+  if [[ -f "$sudoers_file" ]] && [[ "$(sudo cat "$sudoers_file")" == "$sudoers_content" ]]; then
+    info "Performance sudoers already up to date at $sudoers_file"
+  else
+    info "Writing sudoers rules for Performance Mode..."
+    local tmp_sudoers
+    tmp_sudoers=$(mktemp)
+    printf '%s\n' "$sudoers_content" > "$tmp_sudoers"
+    # Validate before installing — a broken sudoers drop-in locks out sudo.
+    if sudo visudo -cqf "$tmp_sudoers" && sudo install -m 0440 -o root -g root "$tmp_sudoers" "$sudoers_file"; then
+      info "Performance sudoers written to $sudoers_file"
     else
-      err "Failed to create performance sudoers file (exit code: $tee_exit)"
+      err "Failed to write performance sudoers file"
     fi
+    rm -f "$tmp_sudoers"
   fi
 
   local memlock_file="/etc/security/limits.d/99-gaming-memlock.conf"
@@ -2288,11 +2313,7 @@ enable_performance_mode() {
     if command -v nvidia-smi &>/dev/null; then
         sudo -n nvidia-smi -pm 1 2>/dev/null && log "NVIDIA persistence mode enabled"
 
-        local max_power
-        max_power=$(nvidia-smi --query-gpu=power.max_limit --format=csv,noheader,nounits 2>/dev/null | head -1 | cut -d'.' -f1)
-        if [[ -n "$max_power" && "$max_power" -gt 0 ]]; then
-            sudo -n nvidia-smi -pl "$max_power" 2>/dev/null && log "NVIDIA power limit set to ${max_power}W"
-        fi
+        sudo -n /usr/local/bin/deckshift-nvidia-power-limit max 2>/dev/null && log "NVIDIA power limit set to max"
 
         for nvidia_pci in /sys/bus/pci/devices/*/power/control; do
             if [[ -f "${nvidia_pci%/power/control}/driver" ]]; then
@@ -2305,7 +2326,7 @@ enable_performance_mode() {
     fi
 
     # Set power profile to performance — sudo -n bypasses the polkit prompt
-    # (NOPASSWD allowed for `powerprofilesctl set *` in /etc/sudoers.d/gaming-session-switch)
+    # (NOPASSWD allowed for the three fixed profiles in /etc/sudoers.d/gaming-mode-sysctl)
     if command -v powerprofilesctl &>/dev/null; then
         sudo -n powerprofilesctl set performance 2>/dev/null || \
             powerprofilesctl set performance 2>/dev/null && log "Power profile set to performance"
@@ -2318,7 +2339,7 @@ restore_balanced_mode() {
     # Read what the user's state actually was before Gaming Mode.
     #
     # A missing saved-state file does NOT mean "guess safe defaults" — it means
-    # switch-to-desktop already consumed the file and restored the real values
+    # deckshift-restore-desktop-state already consumed the file and restored the real values
     # on its way out. Writing powersave/balanced on top of that clobbers a
     # correct restore with a guess, which is wrong on any machine whose normal
     # state is something else (schedutil, or performance on a desktop). So the
@@ -2341,11 +2362,7 @@ restore_balanced_mode() {
 
     # NVIDIA dGPU restore
     if command -v nvidia-smi &>/dev/null; then
-        local default_power
-        default_power=$(nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits 2>/dev/null | head -1 | cut -d'.' -f1)
-        if [[ -n "$default_power" && "$default_power" -gt 0 ]]; then
-            sudo -n nvidia-smi -pl "$default_power" 2>/dev/null
-        fi
+        sudo -n /usr/local/bin/deckshift-nvidia-power-limit default 2>/dev/null
 
         for nvidia_pci in /sys/bus/pci/devices/*/power/control; do
             if [[ -f "${nvidia_pci%/power/control}/driver" ]]; then
@@ -2370,7 +2387,7 @@ restore_balanced_mode() {
     if (( have_saved_state )); then
         log "Pre-Gaming-Mode state restored (governor=$target_gov profile=${saved_pp:-balanced})"
     else
-        log "No saved state to restore (already restored by switch-to-desktop); GPU state reset only"
+        log "No saved state to restore (already restored by deckshift-restore-desktop-state); GPU state reset only"
     fi
 }
 
@@ -2385,6 +2402,7 @@ cleanup() {
     pkill -f steam-library-mount 2>/dev/null || true
     pkill -f gaming-keybind-monitor 2>/dev/null || true
     sudo -n /usr/local/bin/gamescope-nm-stop 2>/dev/null || true
+    /usr/local/bin/deckshift-restore-desktop-state
     restore_balanced_mode
     rm -f /tmp/.gaming-session-active
     if [[ -n "$DECKSHIFT_LOG" ]]; then
@@ -2396,6 +2414,20 @@ trap cleanup EXIT INT TERM
 
 # Enable performance mode immediately on session start
 enable_performance_mode
+
+# switch-to-gaming masks suspend so the monitor dropping out while Hyprland
+# exits can't put the machine to sleep. That window is over once this session
+# is up, so lift the mask after gamescope's initial modeset. Left in place, it
+# turned Steam's idle sleep into a fake sleep (screen off, system awake) that
+# came back to a black, unresponsive UI.
+(
+    sleep 30
+    if systemctl is-enabled suspend.target 2>/dev/null | grep -q masked; then
+        sudo -n systemctl unmask --runtime sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
+        sudo -n systemctl daemon-reload 2>/dev/null
+        log "Suspend targets unmasked — Steam idle sleep can suspend the system"
+    fi
+) &
 
 # gamescope-session-plus runs $GAMESCOPE_BIN (default /usr/bin/gamescope) and
 # never looks gamescope up on PATH, so the wrapper has to be named here. A
@@ -2480,6 +2512,57 @@ SESSION_DESKTOP
 
   info "Created $session_desktop"
 
+  # deckshift-restore-desktop-state — the one place that undoes what entering
+  # Gaming Mode changed. Every exit path calls it: switch-to-desktop
+  # (Super+Shift+R), os-session-select (Steam's "Switch to Desktop") and the
+  # session wrapper's EXIT trap (crashes, logouts). Previously only
+  # switch-to-desktop unmasked suspend, so leaving through Steam's menu kept
+  # suspend masked until reboot. Idempotent — safe to run more than once.
+  info "Creating desktop-state restore helper..."
+  local restore_helper="/usr/local/bin/deckshift-restore-desktop-state"
+
+  sudo tee "$restore_helper" > /dev/null << 'RESTORE_HELPER'
+#!/bin/bash
+log() { logger -t deckshift-restore "$*"; }
+
+# Power state saved by the session wrapper on entry. Parsed rather than
+# sourced: only the two known keys are read.
+SAVED_STATE_FILE="$HOME/.cache/deckshift/saved-state"
+if [[ -f "$SAVED_STATE_FILE" ]]; then
+  gov=$(sed -n 's/^PRE_GAMING_CPU_GOVERNOR=\([a-z_]*\)$/\1/p' "$SAVED_STATE_FILE")
+  profile=$(sed -n 's/^PRE_GAMING_POWER_PROFILE=\([a-z-]*\)$/\1/p' "$SAVED_STATE_FILE")
+  for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo "${gov:-powersave}" > "$f" 2>/dev/null
+  done
+  if [[ -n "$profile" ]] && command -v powerprofilesctl &>/dev/null; then
+    sudo -n powerprofilesctl set "$profile" 2>/dev/null || \
+      powerprofilesctl set "$profile" 2>/dev/null
+  fi
+  rm -f "$SAVED_STATE_FILE"
+  log "Restored governor=${gov:-powersave} profile=${profile:-unchanged}"
+fi
+
+# Unmask both /etc and /run masking symlinks (the gaming-mode mask uses
+# --runtime, which lives in /run; some systemd versions don't clear it via
+# plain `unmask`). Then daemon-reload so logind's CanSuspend cache refreshes
+# — without this, `systemctl suspend` returns "Access denied" via polkit even
+# though the masks are gone.
+if systemctl is-enabled sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null | grep -q masked; then
+  sudo -n systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
+  sudo -n systemctl unmask --runtime sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
+  sudo -n systemctl daemon-reload 2>/dev/null
+  log "Suspend targets unmasked"
+fi
+
+# Re-enable Bluetooth (Steam may have turned the adapter off)
+sudo -n /usr/bin/rfkill unblock bluetooth 2>/dev/null || true
+sudo -n /usr/bin/systemctl start bluetooth.service 2>/dev/null || true
+exit 0
+RESTORE_HELPER
+
+  sudo chmod +x "$restore_helper"
+  info "Created $restore_helper"
+
   # os-session-select — Steam's "Exit to Desktop" handler
   #
   # When you click Steam > Power > "Exit to Desktop" inside Gaming Mode,
@@ -2492,6 +2575,9 @@ SESSION_DESKTOP
   sudo tee "$os_session_select" > /dev/null << 'OS_SESSION_SELECT'
 #!/bin/bash
 rm -f /tmp/.gaming-session-active
+# Restore synchronously: the wrapper's EXIT trap can be SIGKILL'd by the
+# sddm restart below before it gets this far.
+/usr/local/bin/deckshift-restore-desktop-state
 sudo -n /usr/local/bin/gaming-session-switch desktop 2>/dev/null || {
   echo "Warning: Failed to update session config"
 }
@@ -2627,38 +2713,12 @@ rm -f /tmp/.gaming-session-active
 # saw no marker and no-oped on every single return.
 touch /tmp/.deckshift-just-returned 2>/dev/null || true
 
-# SYNCHRONOUS POWER RESTORE — done first because the trap-based restore in
+# SYNCHRONOUS RESTORE — done first because the trap-based restore in
 # gamescope-session-nm-wrapper can be SIGKILL'd by `systemctl restart sddm`
-# before it completes, leaving CPU governor / power profile stuck at
-# "performance". Reading the saved-state file first guarantees the user's
-# pre-Gaming-Mode values are restored even if the wrapper's trap dies.
-SAVED_STATE_FILE="$HOME/.cache/deckshift/saved-state"
-if [[ -f "$SAVED_STATE_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$SAVED_STATE_FILE"
-  for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo "${PRE_GAMING_CPU_GOVERNOR:-powersave}" > "$gov" 2>/dev/null
-  done
-  if command -v powerprofilesctl &>/dev/null && [[ -n "${PRE_GAMING_POWER_PROFILE:-}" ]]; then
-    sudo -n powerprofilesctl set "$PRE_GAMING_POWER_PROFILE" 2>/dev/null || \
-      powerprofilesctl set "$PRE_GAMING_POWER_PROFILE" 2>/dev/null
-  fi
-  rm -f "$SAVED_STATE_FILE"
-fi
-
-# Unmask both /etc and /run masking symlinks (the gaming-mode mask uses
-# --runtime, which lives in /run; some systemd versions don't clear it via
-# plain `unmask`). Then daemon-reload so logind's CanSuspend cache refreshes
-# — without this, `systemctl suspend` returns "Access denied" via polkit even
-# though the masks are gone.
-sudo -n systemctl unmask sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
-sudo -n systemctl unmask --runtime sleep.target suspend.target hibernate.target hybrid-sleep.target 2>/dev/null
-sudo -n systemctl daemon-reload 2>/dev/null
+# before it completes. Restores power state, unmasks suspend, re-enables
+# Bluetooth.
+/usr/local/bin/deckshift-restore-desktop-state
 sudo -n /usr/local/bin/gaming-session-switch desktop 2>/dev/null || true
-
-# Re-enable Bluetooth
-sudo -n /usr/bin/rfkill unblock bluetooth 2>/dev/null || true
-sudo -n /usr/bin/systemctl start bluetooth.service 2>/dev/null || true
 
 timeout 5 steam -shutdown 2>/dev/null || true
 sleep 1
@@ -3230,6 +3290,7 @@ verify_installation() {
     ["/usr/local/bin/gamescope-nm-start"]="755:NetworkManager start script"
     ["/usr/local/bin/gamescope-nm-stop"]="755:NetworkManager stop script"
     ["/usr/local/bin/steam-library-mount"]="755:Steam library drive auto-mount script"
+    ["/usr/local/bin/deckshift-restore-desktop-state"]="755:Restores power/suspend/Bluetooth on every Gaming Mode exit"
     ["/usr/bin/steamos-session-select"]="755:Steam compatibility (from AUR package)"
     ["/usr/bin/steamos-update"]="755:Steam compatibility (from AUR package)"
     ["/usr/bin/jupiter-biosupdate"]="755:Steam compatibility (from AUR package)"

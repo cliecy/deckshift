@@ -189,6 +189,8 @@ for f in \
   /usr/local/bin/gamescope-nm-stop \
   /usr/local/bin/steam-library-mount \
   /usr/local/bin/deckshift-portal-recovery \
+  /usr/local/bin/deckshift-restore-desktop-state \
+  /usr/local/bin/deckshift-nvidia-power-limit \
   /usr/local/bin/deckshift-settings \
   /usr/share/applications/deckshift-settings.desktop \
   /usr/lib/os-session-select \
